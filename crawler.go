@@ -150,8 +150,7 @@ func (c *Crawler) getLinks(body io.Reader) map[string]bool {
 	}
 }
 
-func (c *Crawler) getLink(rawLink string) (string, error) {
-	var link string
+func (c *Crawler) getLink(rawLink string) (link string, err error) {
 	if strings.HasPrefix(rawLink, "/") {
 		// Transform relative link into absolute
 		link = (&url.URL{Scheme: c.parsedRootURL.Scheme, Host: c.host, Path: rawLink}).String()
@@ -165,15 +164,15 @@ func (c *Crawler) getLink(rawLink string) (string, error) {
 	return link, nil
 }
 
-func (c *Crawler) Run() (*map[string]interface{}, error) {
+func (c *Crawler) init() error {
 	var err error
 	c.parsedRootURL, err = c.parseURL(c.RootURL)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	c.anchorFilter, err = regexp.Compile(`%23[\w\d\-]+$`) // %23 is #
+	c.anchorFilter, err = regexp.Compile(`(%23|#)[\w\d\-]+$`) // %23 is urlencoded #
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	c.log = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
@@ -181,6 +180,14 @@ func (c *Crawler) Run() (*map[string]interface{}, error) {
 	c.host = c.parsedRootURL.Hostname()
 	c.visited = make(map[string]interface{})
 	c.wg = &sync.WaitGroup{}
+	return nil
+}
+
+func (c *Crawler) Run() (*map[string]interface{}, error) {
+	err := c.init()
+	if err != nil {
+		return nil, err
+	}
 
 	c.wg.Add(1)
 	go c.crawl(c.RootURL)
