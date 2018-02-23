@@ -9,6 +9,8 @@ import (
 	"io"
 	"golang.org/x/net/html"
 	"strings"
+	"regexp"
+	"errors"
 )
 
 type Crawler struct {
@@ -19,17 +21,18 @@ type Crawler struct {
 	lock          sync.Mutex
 	wg            *sync.WaitGroup
 	visited       map[string]interface{}
-	HttpClient    *http.Client
+	httpClient    *http.Client
+	anchorFilter  *regexp.Regexp
 }
 
-func (c *Crawler) doRequest(urlStr string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", urlStr, nil)
+func (c *Crawler) doRequest(method string, urlStr string) (*http.Response, error) {
+	req, err := http.NewRequest(method, urlStr, nil)
 	if err != nil {
 		c.log.Printf("Failed to init request to URL %q", urlStr)
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "monzo-web-crawler")
-	res, err := c.HttpClient.Do(req)
+	res, err := c.httpClient.Do(req)
 	if err != nil {
 		c.log.Printf("Error sending request to URL %q", urlStr)
 		return nil, err
@@ -37,36 +40,77 @@ func (c *Crawler) doRequest(urlStr string) (*http.Response, error) {
 	return res, nil
 }
 
+func (c *Crawler) isHTML(urlStr string) (bool, error) {
+	resp, err := c.doRequest("HEAD", urlStr)
+	if err != nil {
+		return false, err
+	}
+	if r := resp.Header.Get("Content-Type"); !strings.HasPrefix(r, "text/html") {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (c *Crawler) getHTML(urlStr string) (*http.Response, error) {
+	return c.doRequest("GET", urlStr)
+}
+
+func (c *Crawler) setVisited(key string, val interface{}) {
+	c.lock.Lock()
+	c.visited[key] = val
+	c.lock.Unlock()
+}
+
 func (c *Crawler) crawl(urlStr string) {
 	defer c.wg.Done()
+
+	// Check if any other goroutine has already processed this URL
 	c.lock.Lock()
 	_, visited := c.visited[urlStr]
 	if visited {
 		c.lock.Unlock()
 		return
 	} else {
+		// Set preliminary status to mark ownership of this URL
 		c.visited[urlStr] = "visited"
 		c.lock.Unlock()
 	}
 
-	resp, err := c.doRequest(urlStr)
+	isHTML, err := c.isHTML(urlStr)
 	if err != nil {
-		c.lock.Lock()
-		c.visited[urlStr] = "error"
-		c.lock.Unlock()
+		c.setVisited(urlStr, "error")
 		return
 	}
+
+	if !isHTML {
+		// js maybe? skip anyway
+		c.setVisited(urlStr, "non-html")
+		return
+	}
+
+	resp, err := c.getHTML(urlStr)
+	if err != nil {
+		c.setVisited(urlStr, "error")
+		return
+	}
+
 	links := c.getLinks(resp.Body)
 	resp.Body.Close()
 
-	c.lock.Lock()
-	c.visited[urlStr] = links
-	c.lock.Unlock()
-
+	c.setVisited(urlStr, links)
 	for link := range links {
 		c.wg.Add(1)
 		go c.crawl(link)
 	}
+}
+
+func (c *Crawler) parseURL(urlStr string) (*url.URL, error) {
+	parsedURL, err := url.Parse(urlStr)
+	if err != nil {
+		c.log.Printf("Cannot parse URL %q", urlStr)
+		return nil, err
+	}
+	return parsedURL, nil
 }
 
 func (c *Crawler) isCorrectHost(urlStr string) bool {
@@ -75,7 +119,6 @@ func (c *Crawler) isCorrectHost(urlStr string) bool {
 		return false
 	}
 	if parsedURL.Hostname() != c.host {
-		//c.log.Printf("External host, not following: %q", urlStr)
 		return false
 	}
 	return true
@@ -98,45 +141,50 @@ func (c *Crawler) getLinks(body io.Reader) map[string]bool {
 				if attr.Key != "href" {
 					continue
 				}
-				var link string
-				if strings.HasPrefix(attr.Val, "/") {
-					link = (&url.URL{Scheme: c.parsedRootURL.Scheme, Host: c.host, Path: attr.Val}).String()
-				} else if c.isCorrectHost(attr.Val) {
-					link = attr.Val
-				} else {
-					continue
+				link, err := c.getLink(attr.Val)
+				if err == nil {
+					links[link] = true
 				}
-				if strings.HasSuffix(link, ".jpg") || strings.HasSuffix(link, ".png") {
-					continue
-				}
-				links[link] = true
 			}
 		}
 	}
 }
 
-func (c *Crawler) parseURL(urlStr string) (*url.URL, error) {
-	parsedURL, err := url.Parse(urlStr)
-	if err != nil {
-		c.log.Printf("Cannot parse URL %q", urlStr)
-		return nil, err
+func (c *Crawler) getLink(rawLink string) (string, error) {
+	var link string
+	if strings.HasPrefix(rawLink, "/") {
+		// Transform relative link into absolute
+		link = (&url.URL{Scheme: c.parsedRootURL.Scheme, Host: c.host, Path: rawLink}).String()
+	} else if c.isCorrectHost(rawLink) {
+		link = rawLink
+	} else {
+		return "", errors.New("link to an external host")
 	}
-	return parsedURL, nil
+	// Strip anchor part from the end of the link
+	link = c.anchorFilter.ReplaceAllLiteralString(link, "")
+	return link, nil
 }
 
-func (c *Crawler) Start() (*map[string]interface{}, error) {
+func (c *Crawler) Run() (*map[string]interface{}, error) {
 	var err error
 	c.parsedRootURL, err = c.parseURL(c.RootURL)
 	if err != nil {
 		return nil, err
 	}
+	c.anchorFilter, err = regexp.Compile(`%23[\w\d\-]+$`) // %23 is #
+	if err != nil {
+		return nil, err
+	}
+
 	c.log = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
-	c.HttpClient = &http.Client{}
+	c.httpClient = &http.Client{}
 	c.host = c.parsedRootURL.Hostname()
 	c.visited = make(map[string]interface{})
 	c.wg = &sync.WaitGroup{}
+
 	c.wg.Add(1)
 	go c.crawl(c.RootURL)
 	c.wg.Wait()
+
 	return &c.visited, nil
 }
